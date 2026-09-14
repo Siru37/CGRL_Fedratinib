@@ -1,0 +1,126 @@
+"""Analyze DHRS13-KPNA contacts in AlphaFold 3 CIF files.
+
+Requires Python >=3.9 and NumPy.
+Usage: python analyze_dhrs13_kpna.py --input-dir cif_files --output-dir results
+Input filenames must contain kpna1 ... kpna7.
+Supports single-model AF3 server CIF files with standard amino acids and
+one atom record per line. Does not automatically identify ARM binding pockets,
+establish NLS function, or estimate binding affinity.
+"""
+import argparse
+import csv
+import json
+import re
+import shlex
+from pathlib import Path
+import numpy as np
+
+AA = dict(zip('ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU LYS MET PHE PRO SER THR TRP TYR VAL'.split(), 'ARNDCQEGHILKMFPSTWYV'))
+
+def parse_atoms(path):
+    lines = path.read_text(encoding='utf-8').splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith('_atom_site.'))
+    columns = []
+    while start < len(lines) and lines[start].startswith('_atom_site.'):
+        columns.append(lines[start].strip())
+        start += 1
+    chains = {}
+    models = set()
+    for line in lines[start:]:
+        if line.startswith('#') or line.startswith('loop_') or line.startswith('_'):
+            break
+        if not line.strip():
+            continue
+        fields = shlex.split(line)
+        if len(fields) != len(columns):
+            raise ValueError('Unsupported atom_site row format: ' + path.name)
+        atom = dict(zip(columns, fields))
+        if atom['_atom_site.type_symbol'].upper() in ('H', 'D'):
+            continue
+        models.add(atom.get('_atom_site.pdbx_PDB_model_num', '1'))
+        chain = atom['_atom_site.label_asym_id']
+        residue = int(atom['_atom_site.label_seq_id'])
+        chains.setdefault(chain, {}).setdefault(residue, []).append(atom)
+    if len(models) != 1:
+        raise ValueError('Only single-model CIF files are supported.')
+    return chains
+
+def coordinates(atoms):
+    return np.array([[float(a['_atom_site.Cartn_' + q]) for q in 'xyz'] for a in atoms], dtype=float)
+
+def confidence(atoms):
+    # AF3 B_iso_or_equiv stores per-atom pLDDT; average over each residue's heavy atoms.
+    return float(np.mean([float(a['_atom_site.B_iso_or_equiv']) for a in atoms]))
+
+def analyze(path, output_dir, kpna, cutoff=5.0, chain_a='A', chain_b='B'):
+    chains = parse_atoms(path)
+    a, b = chains[chain_a], chains[chain_b]
+    a_ids, b_ids = list(a), list(b)
+    matrix = np.empty((len(a_ids), len(b_ids)))
+    contacts = []
+    # Preserve the original float64 heavy-atom distance calculation and argmin order.
+    for ai, i in enumerate(a_ids):
+        for bj, j in enumerate(b_ids):
+            distances = np.linalg.norm(coordinates(a[i])[:, None, :] - coordinates(b[j])[None, :, :], axis=2)
+            ix = np.unravel_index(distances.argmin(), distances.shape)
+            distance = float(distances[ix])
+            matrix[ai, bj] = distance
+            # Apply the cutoff before rounding distances for CSV output.
+            if distance <= cutoff:
+                contacts.append([i, AA[a[i][0]['_atom_site.label_comp_id']], j,
+                    AA[b[j][0]['_atom_site.label_comp_id']], round(distance, 3),
+                    a[i][ix[0]]['_atom_site.label_atom_id'], b[j][ix[1]]['_atom_site.label_atom_id'],
+                    round(confidence(a[i]), 2), round(confidence(b[j]), 2)])
+    headers = ['DHRS13_residue', 'DHRS13_aa', kpna+'_residue', kpna+'_aa',
+        'minimum_heavy_atom_distance_A', 'DHRS13_atom', kpna+'_atom',
+        'DHRS13_mean_pLDDT', kpna+'_mean_pLDDT']
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output = output_dir / f'{kpna}_interface_contacts_{cutoff:g}A.csv'
+    with output.open('w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(headers)
+        writer.writerows(contacts)
+    metadata = {'source': path.name, 'cutoff_A': cutoff, 'contact_residue_pairs': len(contacts), 'chains': {}}
+    for name, residues in [(chain_a, a), (chain_b, b)]:
+        metadata['chains'][name] = {
+            'residue_ids': list(residues),
+            'sequence': ''.join(AA[x[0]['_atom_site.label_comp_id']] for x in residues.values()),
+            'label_auth_numbering_equal': all(atom['_atom_site.label_seq_id'] == atom['_atom_site.auth_seq_id'] for atoms in residues.values() for atom in atoms)}
+    metadata['regions'] = []
+    for lo, hi in [(170, 190), (309, 377), (353, 372), (363, 370)]:
+        indices = [k for k, n in enumerate(a_ids) if lo <= n <= hi]
+        if not indices:
+            continue
+        sub = matrix[indices, :]
+        ix = np.unravel_index(sub.argmin(), sub.shape)
+        metadata['regions'].append({'start': lo, 'end': hi,
+            'minimum_distance_A': float(sub[ix]),
+            'nearest_pair': [a_ids[indices[ix[0]]], b_ids[ix[1]]],
+            'contact_pairs': int((sub <= cutoff).sum()),
+            'mean_residue_pLDDT': float(np.mean([confidence(a[a_ids[k]]) for k in indices]))})
+    (output_dir / f'{kpna}_summary.json').write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding='utf-8')
+    return output
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--input-dir', type=Path, required=True)
+    parser.add_argument('--output-dir', type=Path, default=Path('results'))
+    parser.add_argument('--cutoff', type=float, default=5.0)
+    parser.add_argument('--dhrs13-chain', default='A')
+    parser.add_argument('--kpna-chain', default='B')
+    args = parser.parse_args()
+    seen = set()
+    for path in sorted(args.input_dir.glob('*.cif')):
+        match = re.search(r'kpna([1-7])(?!\d)', path.name, re.I)
+        if not match:
+            continue
+        kpna = 'KPNA' + match.group(1)
+        if kpna in seen:
+            raise ValueError(f'Multiple CIF files found for {kpna}. Use separate input folders for different models.')
+        seen.add(kpna)
+        print(analyze(path, args.output_dir, kpna, args.cutoff, args.dhrs13_chain, args.kpna_chain))
+    if not seen:
+        raise FileNotFoundError('No CIF files with kpna1 through kpna7 in their filenames were found.')
+
+if __name__ == '__main__':
+    main()
